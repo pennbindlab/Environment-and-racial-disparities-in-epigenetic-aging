@@ -1,0 +1,860 @@
+---
+title: "Contributions of neighborhood social environment and air pollution exposure
+  to Black-White disparities in epigenetic aging"
+author: "Isabel Yannatos"
+date: "`r Sys.Date()`"
+Date created: 3/17/2022
+Date last modified: 8/25/2022
+output: word_document
+---
+
+Description of analysis and sample: The sample is the Epigenetic Clocks sub-sample. These individuals participated in the 2016 Venous Blood Study and their DNA methylation levels were measured.
+
+This file includes descriptions of epigenetic clock data, individual-level variables, and environmental exposures from restricted data. It includes table summaries, regression and decomposition models, and plots of results.
+
+Restricted data used: Pollution data and residential location from CDR
+
+```{r setup, include=FALSE, message = FALSE}
+library(tidyverse)
+library(haven)
+library(knitr)
+library(Hmisc)
+library(gtsummary)
+library(flextable)
+library(oaxaca)
+library(cowplot)
+library(emmeans)
+library(showtext)
+library(lsr)
+
+options(na.action = na.exclude)
+
+knitr::opts_chunk$set(
+  echo=FALSE,
+  warning=FALSE,
+  message=FALSE
+  #fig.align='left'
+)
+
+set.seed(3005)
+
+bootstrap <- 10000
+```
+
+```{r setupfigures}
+regression_theme <- list(
+  # package-wide: suppress message
+  "pkgwide-lgl:quiet" = TRUE,
+  #regression tables format: p-value thresholds divided by 6 to account for multiple comparisons (0.001/6 = .000167, 0.01/6 = .00167, 0.05/6 = .00833)
+  "tbl_regression-fn:addnl-fn-to-run" = function (x) add_significance_stars(x, pattern = "{estimate}{stars}\n({conf.low},{conf.high})", thresholds = c(.000167, .00167, .00833), hide_se = TRUE) 
+)
+set_gtsummary_theme(regression_theme)
+set_flextable_defaults(digits = 2, font.size = 10, padding.bottom=0, padding.top=0, padding.left = 0, padding.right = 0)
+
+font_add(family = "Arial", regular = "arial.ttf")
+showtext_auto()
+
+theme_plot <- function(base_size = 10) {
+  theme_bw(base_size = base_size, base_family = "Arial") %+replace%
+    theme(legend.direction = "horizontal",
+          legend.justification = c(0,1),
+          legend.position = c(0.02,0.98),
+          axis.text = element_text(size = 8),
+          axis.title = element_text(size = 10),
+          legend.title = element_text(size = 10, face = "bold"),
+          legend.title.align = 0,
+          legend.text = element_text(size = 8),
+          legend.margin = margin(t = 0, r= 0, b = 0, l = 0, unit = "pt"),
+          legend.spacing.x = unit(0, "points"),
+          legend.spacing.y = unit(1, "points"),
+          title = element_text(size = 12, face = "bold"))
+}
+theme_set(theme_plot())
+```
+
+```{r individualfiles, include=FALSE}
+##-------------Import Individual-level files----------------------------------##
+# randhrs1992_2018v1 is the RAND cross-wave data file. 
+# Contains demographic and SES information, cleaned and easy to use. Identified by HHIDPN.
+rand <- read_sav("R:/Public/Contributions/Rand/RandHrs2018V1/spss/randhrs1992_2018v1.sav", col_select =  c(HHIDPN, R13AGEM_E, RAGENDER, RAHISPAN, RARACEM, RAEDYRS, H13ATOTA,H13ANETHB, H13ITOT))
+# trk2020tr_r is the tracker file. 
+# Contains weights. Identified by HHID (in a different format, 8 digits instead of 6) + PN
+trk2020 <- read_sav("R:/Public/Tracker/spss/trk2020tr_r.sav", encoding = "latin1", 
+                    col_select = c(HHID, PN, VBSI16WGTRA))
+trk2020 <- mutate(trk2020, HHIDPN = as.numeric(str_sub(HHID,1,6))*1000 + as.numeric(PN), .keep = "unused") 
+# EPICLOCKA_R contains epigenetic clock values. Identified by HHID+PN
+EPICLOCKA_R <- read_sav("R:/Public/XWave/HrsEpigeneticClocks/spss/EPICLOCKA_R.sav", col_select = c(DNAMGRIMAGE, MPOA, HHID, PN))
+EPICLOCKA_R <- mutate(EPICLOCKA_R, HHIDPN = as.numeric(HHID)*1000 + as.numeric(PN), 
+                      .keep = "unused")
+#pgenscore4 contains ancestry-informative principal components.
+#Separate files for African and European ancestry. Identified by HHID+PN.
+pgenscore4a_r <- read_sav("R:/Public/XWave/PGS/spss/pgenscore4a_r.sav", 
+                          col_select = c(HHID, PN, starts_with("PC")))
+pgenscore4a_r <- mutate(pgenscore4a_r, HHIDPN = as.numeric(HHID)*1000 + as.numeric(PN), Ancestry = "A", .keep = "unused")
+pgenscore4e_r <- read_sav("R:/Public/XWave/PGS/spss/pgenscore4e_r.sav", 
+                          col_select = c(HHID, PN, starts_with("PC")))
+pgenscore4e_r <- mutate(pgenscore4e_r, HHIDPN = as.numeric(HHID)*1000 + as.numeric(PN), Ancestry = "E", .keep = "unused")
+PC_10 <- merge(pgenscore4a_r, pgenscore4e_r, all = TRUE)
+
+epiclocks_individual <- left_join(EPICLOCKA_R, trk2020, by = "HHIDPN") %>%
+  left_join(rand, by = "HHIDPN") %>%
+  left_join(PC_10, by = "HHIDPN") %>%
+  rename("GrimAge" = "DNAMGRIMAGE", "DPoAm" = "MPOA") %>%
+  mutate(Age = R13AGEM_E / 12, .keep = "unused")
+```
+
+Number missing sample weights: `r nrow(filter(epiclocks_individual, is.na(VBSI16WGTRA)))`.
+Missing weights imputed using mean value.
+
+```{r AgeAccelRegress, include = FALSE}
+##---------------Impute missing sample weights--------------------------------##
+#change missing values to mean
+epiclocks_individual$VBSI16WGTRA[is.na(epiclocks_individual$VBSI16WGTRA)] <- mean(epiclocks_individual$VBSI16WGTRA, na.rm = T)
+
+##-------------Calculate DNAm age acceleration--------------------------------##
+# Using full N=4018 data set. Unweighted and weighted.
+#GrimAge
+#unweighted
+epiclocks_individual$GrimAge_Resid <- resid(lm(GrimAge ~ Age, data = epiclocks_individual))
+#weighted
+epiclocks_individual$GrimAge_weighted <- resid(lm(GrimAge ~ Age, weights = VBSI16WGTRA, data = epiclocks_individual))
+#With Ancestry-informative PC's
+epiclocks_individual$GrimAge_PC <- resid(lm(GrimAge ~ Age + PC1_5A + PC1_5B + PC1_5C + PC1_5D + PC1_5E + PC6_10A + PC6_10B + PC6_10C + PC6_10D + PC6_10E, data = epiclocks_individual))
+
+#Dunedin
+#unweighted
+epiclocks_individual$DPoAm_Resid <- resid(lm(DPoAm ~ Age, data = epiclocks_individual))
+#Weighted
+epiclocks_individual$DPoAm_weighted <- resid(lm(DPoAm ~ Age, data = epiclocks_individual, weights=VBSI16WGTRA))
+#With ancestry-informative PC's
+epiclocks_individual$DPoAm_PC <- resid(lm(DPoAm ~ Age + PC1_5A + PC1_5B + PC1_5C + PC1_5D + PC1_5E + PC6_10A + PC6_10B + PC6_10C + PC6_10D + PC6_10E, data = epiclocks_individual))
+
+#Scale the weighted residuals (default for analyses)
+epiclocks_individual <- mutate(epiclocks_individual, GrimAge_scale = as.numeric(scale(GrimAge_weighted, center = FALSE, scale = TRUE)), DPoAm_scale = as.numeric(scale(DPoAm_weighted, center = FALSE, scale = TRUE)))
+```
+
+```{r covariates, include = FALSE}
+##-------------Set up individual-level covariates-----------------------------##
+epiclocks_individual <- rename(epiclocks_individual, "Income" = "H13ITOT") %>%
+  # sum wealth excluding second home + value of second home = total wealth. Assumes that NA value for second home means respondent doesn't have one and value is 0.
+  mutate(Wealth = H13ATOTA + H13ANETHB, 
+         #Log income and wealth and take Z-score
+         WealthZ = scale(log(Wealth + 1 + abs(min(Wealth))), center = TRUE, scale = TRUE),
+         IncomeZ = scale(log(Income + 1 + abs(min(Income))), center = TRUE, scale = TRUE),
+         #SES index score is the average of wealth and income Z score
+         SES_score = (WealthZ + IncomeZ)/2,
+         #Re-code gender
+         Gender = recode(as_factor(RAGENDER), "1.Male" = "Male", "2.Female" = "Female"))
+#Use weighted quartiles to categorize SES Index. Use highest quartile as the reference group
+epiclocks_individual$IndexQuart <- as.factor(cut(epiclocks_individual$SES_score, 
+        breaks=wtd.quantile(epiclocks_individual$SES_score, weights = epiclocks_individual$VBSI16WGTRA), 
+        labels =FALSE, include.lowest = TRUE)) %>% fct_rev()
+
+#Re-code race and ethnicity. Hispanic includes 344 white, 16 Black, 196 other
+epiclocks_individual$RaceEthnicity <- if_else(epiclocks_individual$RAHISPAN == 1, "Hispanic", 
+  if_else(epiclocks_individual$RARACEM == 1, "White", 
+      if_else(epiclocks_individual$RARACEM == 2, "Black", "Other")))
+epiclocks_individual$RaceEthnicity <- as.factor(epiclocks_individual$RaceEthnicity) %>%
+  fct_relevel("White", "Black", "Hispanic", "Other")
+
+#Re-code Education from years of school to category. 
+#17 represents 17 or more years of school. Use the highest-educated group as the reference
+epiclocks_individual$Education <- as.factor(epiclocks_individual$RAEDYRS) %>%
+  fct_collapse(
+    "College +" = c("16","17"),
+    "Some College" = c("13","14","15"),
+    "High School" = c("12"),
+    "< High School" = c("0","1","2","3","4","5","6","7","8","9","10","11")
+  ) %>% fct_rev()
+epiclocks_individual <- select(epiclocks_individual, -starts_with("RA", ignore.case=F), -starts_with("H13"), -starts_with("PC"), -WealthZ, -IncomeZ)
+
+#Dummy variables for decomposition analyses
+epiclocks_individual <- mutate(epiclocks_individual,
+                               EdLTHS = (Education == "< High School"),
+                               EdHS = (Education == "High School"),
+                               EdSC = (Education == "Some College"),
+                               EdCP = (Education == "College +"),
+                               Index1 = (IndexQuart == 1),
+                               Index2 = (IndexQuart == 2),
+                               Index3 = (IndexQuart == 3),
+                               Index4 = (IndexQuart == 4))
+```
+
+```{r socialstress, include=FALSE}
+##--------------Psychosocial leave-behind questionnaires----------------------##
+#About half of participants responded in 2012, half in 2014. Additional participants responded in earlier waves. Use the most recent wave that has data.
+#Import Section LB from core 2014, 2012, 2010, and 2008. Identified by HHID+PN. Select only neighborhood rating variables.
+#2014 wave
+H14LB <- read_sav("R:/Public/2014hrs/Final/Core/spss/H14LB_R.sav", 
+                  col_select = c(HHID, PN, starts_with("OLB020")))
+H14LB <- mutate(H14LB, HHIDPN = as.numeric(HHID)*1000 + as.numeric(PN), 
+                .keep = "unused") %>%
+  #remove people with all na (did not respond this wave)
+  filter(rowSums(is.na(select(H14LB, OLB020A:OLB020H))) != ncol(select(H14LB, OLB020A:OLB020H))) %>%
+  rename("Question1" = "OLB020A", "Question2" = "OLB020B",  "Question3" = "OLB020C",  "Question4" = "OLB020D", "Question5" = "OLB020E",  "Question6" = "OLB020F",  "Question7" = "OLB020G",  "Question8" = "OLB020H") 
+H14LB$LBWave <- 2014
+
+#2012 wave
+H12LB <- read_sav("R:/Public/2012hrs/Final/Core/spss/H12LB_R.sav", 
+                  col_select = c(HHID, PN, starts_with("NLB021")))
+H12LB <- mutate(H12LB, HHIDPN = as.numeric(HHID)*1000 + as.numeric(PN), 
+                .keep = "unused") %>%
+  filter(rowSums(is.na(select(H12LB, NLB021A:NLB021H))) != ncol(select(H12LB, NLB021A:NLB021H))) %>%
+  rename("Question1" = "NLB021A", "Question2" = "NLB021B",  "Question3" = "NLB021C",  "Question4" = "NLB021D", "Question5" = "NLB021E",  "Question6" = "NLB021F",  "Question7" = "NLB021G",  "Question8" = "NLB021H")
+H12LB$LBWave <- 2012
+
+#2010 wave
+H10LB <- read_sav("R:/Public/2010hrs/Final/Core/spss/H10LB_R.sav",
+                  col_select = c(HHID, PN, starts_with("MLB021")))
+H10LB <- mutate(H10LB, HHIDPN = as.numeric(HHID)*1000 + as.numeric(PN), 
+                .keep = "unused") %>%
+  filter(rowSums(is.na(select(H10LB, MLB021A:MLB021H))) != ncol(select(H10LB, MLB021A:MLB021H))) %>%
+  rename("Question1" = "MLB021A", "Question2" = "MLB021B",  "Question3" = "MLB021C",  "Question4" = "MLB021D", "Question5" = "MLB021E",  "Question6" = "MLB021F",  "Question7" = "MLB021G",  "Question8" = "MLB021H")
+H10LB$LBWave <- 2010
+
+#2008 wave
+H08LB <- read_sav("R:/Public/2008hrs/Final/Core/spss/H08LB_R.sav",
+                  col_select = c(HHID, PN, starts_with("LLB021")))
+H08LB <- mutate(H08LB, HHIDPN = as.numeric(HHID)*1000 + as.numeric(PN), 
+                .keep = "unused") %>%
+  filter(rowSums(is.na(select(H08LB, LLB021A:LLB021H))) != ncol(select(H08LB, LLB021A:LLB021H))) %>%
+  rename("Question1" = "LLB021A", "Question2" = "LLB021B",  "Question3" = "LLB021C",  "Question4" = "LLB021D", "Question5" = "LLB021E",  "Question6" = "LLB021F",  "Question7" = "LLB021G",  "Question8" = "LLB021H")
+H08LB$LBWave <- 2008
+
+#Combine waves
+LeaveBehind <- rbind(H14LB, H12LB, H10LB, H08LB)
+#Get rid of duplicates
+LeaveBehind <- LeaveBehind[!duplicated(LeaveBehind$HHIDPN),]
+
+#For those with fewer than 2 missing, calculate average scores (logged and scaled)
+#Social Stress: all 8 questions together. Not used in these analyses.
+# LeaveBehind$SocialStress <- case_when(
+#   rowSums(is.na(select(LeaveBehind, Question1:Question8))) < 2 ~ as.numeric(scale(log(rowMeans(select(LeaveBehind, Question1:Question8), na.rm = TRUE)), center=T, scale=T))
+# )
+#Physical Disorder: questions on litter/trash, graffitti/vandalism, empty/deserted buildings, and safety
+LeaveBehind$PhysicalDisorder <- case_when(
+  rowSums(is.na(select(LeaveBehind, Question2, Question4, Question6, Question8))) < 2 ~ as.numeric(scale(log(rowMeans(select(LeaveBehind, Question2, Question4, Question6, Question8), na.rm = TRUE))), center = T, scale = T)
+)
+#Social Disorder: questions on do you feel people can be trusted, people are friendly, people will help out, feel like you belong
+LeaveBehind$SocialDisorder <- case_when(
+  rowSums(is.na(select(LeaveBehind, Question1, Question3, Question5, Question7))) < 2 ~ as.numeric(scale(log(rowMeans(select(LeaveBehind, Question1, Question3, Question5, Question7), na.rm = TRUE))), center = T, scale = T)
+)
+
+epiclocks_individual <- left_join(epiclocks_individual, LeaveBehind, by = "HHIDPN")
+
+#save(epiclocks_individual, file ="Epiclocks_individual.Rdata")
+```
+
+```{r import_geographic, include=FALSE}
+##-----------------Geographic-level files-------------------------------------##
+#Social Deprivation Index
+#Imported from the Robert Graham Center website (publicly available)
+library(readxl)
+ACS2015_CTallvars <- read_excel("ACS2015_CTallvars.xlsx")
+SDIData <- rename(ACS2015_CTallvars, "LINKCEN2010Num" = "CT") %>%
+  select(LINKCEN2010Num, sdi_score) %>%
+  mutate(SDI = as.numeric(scale(sdi_score, center=T, scale=T)))
+
+#Air pollution files. 2014 and 2010 averages
+#Particulate Matter 2.5 FAQSD file. Units all ug/m^3
+PM25_Tract <- read_sav("R:/Restricted/HRS_CDR/PollutionV2/spss/PM25_Tract_2002_2016.sav", col_select = c(LINKCEN2010, p205tr2014, p205tr2010))
+PM25_Tract <-  rename(PM25_Tract, "MeanPM25_2014" = "p205tr2014", "MeanPM25_2010" = "p205tr2010")
+#Ozone FAQSD file. Units all ug/m^3
+O3_Tract <- read_sav("R:/Restricted/HRS_CDR/PollutionV2/spss/O3_Tract_2002_2016.sav",
+                     col_select = c(LINKCEN2010, p305tr2014, p305tr2010))
+O3_Tract <- rename(O3_Tract, "MeanO3_2014" = "p305tr2014", "MeanO3_2010" = "p305tr2010")
+#NO2 LUR file. Units ppb. Available 2000-2010.Uses census tracts from 2000
+NO2_tract <- read_sav("R:/Restricted/HRS_CDR/Pollution/spss/n02_tract_0010_modified.sav", col_select = c(LINKCEN2000, P105TR2010))
+NO2_Tract <- rename(NO2_tract, "MeanNO2_2010" = "P105TR2010", "LINKCEN2000_2010" = "LINKCEN2000")
+
+#2014 pollution data
+Pollution_2014 <- full_join(select(PM25_Tract, LINKCEN2010, MeanPM25_2014), select(O3_Tract, LINKCEN2010, MeanO3_2014), by = "LINKCEN2010") %>%
+  rename("LINKCEN2010_2014" = "LINKCEN2010")
+#2010 pollution data
+Pollution_2010 <- full_join(select(PM25_Tract, LINKCEN2010, MeanPM25_2010), select(O3_Tract, LINKCEN2010, MeanO3_2010), by = "LINKCEN2010") %>%
+  rename("LINKCEN2010_2010" = "LINKCEN2010")
+```
+
+```{r merge, include=FALSE}
+##------------Residential location of participants----------------------------##
+#Cross-wave geographic information. Identified by HHID +PN. LINKCEN2010 and LINKCEN2000 are the census-tract identifiers. 
+hrsgeo <- read_sav("R:/Restricted/Geographic Information/xyrDet/spss/hrsxgeo18v8b_r.sav", 
+                   col_select = c(HHID, PN, YEAR, LINKCEN2010, LINKCEN2000))
+#change empty strings to NA
+hrsgeo[hrsgeo == ""] <- NA
+#Use location between 2010 and 2016
+hrsgeo <- mutate(hrsgeo, HHIDPN = as.numeric(HHID)*1000 + as.numeric(PN), .keep = "unused") %>%
+  filter(YEAR <= 2016 & YEAR >= 2010) %>%
+  pivot_wider(names_from = YEAR, values_from = c(LINKCEN2010, LINKCEN2000))
+#Only epiclocks population
+epiclocks_all <- left_join(epiclocks_individual, hrsgeo, by = "HHIDPN") %>%
+  mutate(LINKCEN2010Num = as.numeric(LINKCEN2010_2014)) %>%
+  #Merge environmental and individual data
+  left_join(SDIData, by = "LINKCEN2010Num") %>%
+  left_join(Pollution_2014, by = "LINKCEN2010_2014") %>%
+  left_join(Pollution_2010, by = "LINKCEN2010_2010") %>%
+  left_join(NO2_Tract, by = "LINKCEN2000_2010")
+
+#For some sensitivity analyses, I can use a binary indicator for whether someone moved between the exposure and the outcome (2010 to 2016). Using 2000 Census tracts because 2010 tracts are missing in 2016.
+#2010-2016
+epiclocks_all$Moved_2010_2016 <- if_else(
+  epiclocks_all$LINKCEN2000_2016 != epiclocks_all$LINKCEN2000_2010 | epiclocks_all$LINKCEN2000_2016 != epiclocks_all$LINKCEN2000_2012 | epiclocks_all$LINKCEN2000_2016 != epiclocks_all$LINKCEN2000_2014, TRUE, FALSE)
+```
+
+```{r finalPopulation}
+##---------------Add labels for gtsummary tables------------------------------##
+label(epiclocks_all$Age) <- "Age"
+label(epiclocks_all$GrimAge_scale) <- "GrimAge aging"
+label(epiclocks_all$DPoAm_scale) <- "DunedinPoAm aging"
+label(epiclocks_all$GrimAge_Resid) <- "GrimAge raw residual"
+label(epiclocks_all$DPoAm_Resid) <- "DPoAm raw residual"
+label(epiclocks_all$GrimAge_weighted) <- "GrimAge weighted residual"
+label(epiclocks_all$DPoAm_weighted) <- "DPoAm weighted residual"
+label(epiclocks_all$GrimAge_PC) <- "GrimAge residual with ancestry-informative PCs"
+label(epiclocks_all$DPoAm_PC) <- "DPoAm residual with ancestry-informative PCs"
+label(epiclocks_all$IndexQuart) <- "Wealth/Income Quartile"
+label(epiclocks_all$SDI) <- "Social Deprivation Index"
+#label(epiclocks_all$SocialStress) <- "Social Stress"
+label(epiclocks_all$SocialDisorder) <- "Social Disorder"
+label(epiclocks_all$PhysicalDisorder) <- "Physical Disorder"
+label(epiclocks_all$MeanPM25_2014) <- "PM2.5"
+label(epiclocks_all$MeanPM25_2010) <- "PM2.5 (2010)"
+label(epiclocks_all$MeanO3_2014) <- "Ozone"
+label(epiclocks_all$MeanO3_2010) <- "Ozone (2010)"
+label(epiclocks_all$MeanNO2_2010) <- "NO2 (2010)"
+
+##-----------Study population: Black and White with complete data-------------##
+#Mark cases with incomplete data
+epiclocks_all$Missing <- !complete.cases(select(epiclocks_all, Gender, RaceEthnicity, Education, IndexQuart, SDI, SocialDisorder, PhysicalDisorder, MeanPM25_2014, MeanO3_2014, MeanNO2_2010))
+
+#Include only Black and White
+epiclocks_all <- filter(epiclocks_all, RaceEthnicity == "White" | RaceEthnicity == "Black") %>%
+  droplevels() %>%
+  rename("Race" = "RaceEthnicity") %>%
+  mutate(White = (Race == "White")) #%>% #Necessary for decomposition- logical indicating racial group
+
+save(epiclocks_all, epiclocks_individual, file ="Epiclocks_data.Rdata")
+#load("Epiclocks_data.Rdata")
+
+epiclocks_complete <- filter(epiclocks_all, !Missing)
+```
+
+Complete case analyses excluding all cases missing data. `r nrow(filter(epiclocks_all, Missing))` have incomplete data and are excluded. Excluded participants are more likely to be Black (N=`r nrow(filter(epiclocks_all, Missing & Race == "Black"))`, p<0.001) and younger (Age = `r round(mean(epiclocks_all$Age[epiclocks_all$Missing]),2)` +- `r round(sd(epiclocks_all$Age[epiclocks_all$Missing]), 2)` years, p<0.001) than included participants.
+They also have significantly higher age acceleration (p<0.001), lower education (p< 0.005) and income/wealth (p<0.001), and higher exposure to SDI (p<0.001), social and physical disorder (p<0.05) PM2.5 (p<0.01), and NO2 (p<0.001).
+
+`r nrow(filter(epiclocks_complete, Moved_2010_2016))` individuals in the final sample changed residential census tract between 2010 and 2016 and were excluded from a sensitivity analysis.
+
+## Table 1
+
+```{r table1, results ='asis'}
+#Table 1
+CohensD <- function(data, variable, by, ...) {
+  cohensD(data = data, as.formula(glue::glue("{variable} ~ {by}")), method = "unequal")
+}
+CramersV <- function(data, variable, by, ...) {
+  cramersV(table(data[[variable]], data[[by]]))
+}
+tbl_summary(epiclocks_complete, by = Race, include = c(Age, Gender, GrimAge_scale, DPoAm_scale, Education, IndexQuart, SDI, SocialDisorder, PhysicalDisorder, MeanPM25_2014, MeanO3_2014, MeanNO2_2010), 
+            statistic = list(all_continuous() ~ "{mean} ({sd})"), 
+            digits = list(all_continuous() ~ 2), 
+            label = list(IndexQuart ~ "Wealth/Income Quartile",
+                         Age ~ "Age (years)",
+                         MeanPM25_2014 ~ "PM2.5 (μg/m\U00B3)",
+                         MeanO3_2014 ~ "Ozone (μg/m\U00B3)",
+                         MeanNO2_2010 ~ "NO\U2082 (ppb)"
+                         )) %>% 
+  #add custom stat for effect size
+  add_overall() %>% add_p() %>% add_stat(fns = list(all_continuous() ~ CohensD, all_categorical() ~ CramersV)) %>% modify_header(add_stat_1 ~ "Effect Size") %>% modify_footnote(add_stat_1 ~ "Cohen's D; Cramer's V") %>% modify_caption("**Sample characteristics and racial disparities**") %>% bold_labels() %>%
+  as_flex_table() %>% bold(part = "header") %>% fontsize(size = 10, part = "all") %>%
+  set_table_properties(layout = 'autofit', width = 1)
+
+```
+
+Percent difference in acceleration (absolute difference over average)
+
+GrimAge: `r abs(mean(epiclocks_complete$GrimAge_scale[epiclocks_complete$Race == "Black"]) - mean(epiclocks_complete$GrimAge_scale[epiclocks_complete$Race == "White"]))*100/((mean(epiclocks_complete$GrimAge_scale[epiclocks_complete$Race == "Black"]) + mean(epiclocks_complete$GrimAge_scale[epiclocks_complete$Race == "White"]))/2)`% 
+
+DPoAm: `r abs(mean(epiclocks_complete$DPoAm_scale[epiclocks_complete$Race == "Black"]) - mean(epiclocks_complete$DPoAm_scale[epiclocks_complete$Race == "White"]))*100/((mean(epiclocks_complete$DPoAm_scale[epiclocks_complete$Race == "Black"]) + mean(epiclocks_complete$DPoAm_scale[epiclocks_complete$Race == "White"]))/2)`% 
+
+## Regression Models
+
+Model 1: DNAm aging ~ race (total disparity magnitude)  
+Model 2: DNAm aging ~ race + gender + individual SES and education  
+Model 3-7: add each environmental measure  
+
+```{r regmodels, results = 'asis'}
+LinearModels <- function(clock) {
+  Model_1 <- lm(epiclocks_complete[[clock]] ~ Race, epiclocks_complete, weights = VBSI16WGTRA)
+  Model_2 <- update(Model_1, . ~ . + Gender + Education + IndexQuart)
+  Model_3 <- update(Model_2, .~. + SDI)
+  Model_4 <- update(Model_2, .~. + SocialDisorder)
+  Model_5 <- update(Model_2, .~. + PhysicalDisorder)
+  Model_6 <- update(Model_2, .~. + MeanPM25_2014)
+  Model_7 <- update(Model_2, .~. + MeanO3_2014)
+  Model_8 <- update(Model_2, .~. + MeanNO2_2010)
+  
+  clock_name <- gsub("_scale","",clock)
+  
+  tbl_1 <-tbl_regression(Model_1, intercept = TRUE) %>%
+    add_glance_table(include = c(r.squared, AIC)) %>% 
+    modify_header(estimate = "Total disparity", label = clock_name) %>% bold_labels()
+  tbl_2 <-tbl_regression(Model_2, intercept = TRUE, label = IndexQuart ~ "Quartile Wealth/Income") %>%
+    add_glance_table(include = c(r.squared, AIC)) %>%
+    modify_header(estimate = "Individual SES", label = NA)
+  tbl_3 <-tbl_regression(Model_3, intercept = TRUE, label = list(IndexQuart ~ "Quartile Wealth/Income", SDI ~ "Neighborhood Exposure")) %>%
+    add_glance_table(include = c(r.squared, AIC)) %>%
+    modify_header(estimate = "SDI", label = NA)
+  tbl_4 <-tbl_regression(Model_4, intercept = TRUE, label = list(IndexQuart ~ "Quartile Wealth/Income", SocialDisorder ~ "Neighborhood Exposure")) %>% 
+    add_glance_table(include = c(r.squared, AIC)) %>%
+    modify_header(estimate = "Social Disorder", label = NA)
+  tbl_5 <-tbl_regression(Model_5, intercept = TRUE, label = list(IndexQuart ~ "Quartile Wealth/Income", PhysicalDisorder ~ "Neighborhood Exposure")) %>%
+    add_glance_table(include = c(r.squared, AIC)) %>%
+    modify_header(estimate = "Physical Disorder", label = NA)
+  tbl_6 <-tbl_regression(Model_6, intercept = TRUE, label = list(IndexQuart ~ "Quartile Wealth/Income", MeanPM25_2014 ~ "Neighborhood Exposure")) %>%
+    add_glance_table(include = c(r.squared, AIC)) %>%
+    modify_header(estimate = "PM2.5", label = NA)
+  tbl_7 <-tbl_regression(Model_7, intercept = TRUE, label = list(IndexQuart ~ "Quartile Wealth/Income", MeanO3_2014 ~ "Neighborhood Exposure")) %>%
+    add_glance_table(include = c(r.squared, AIC)) %>%
+    modify_header(estimate = "Ozone", label = NA)
+  tbl_8 <-tbl_regression(Model_8, intercept = TRUE, list(IndexQuart ~ "Quartile Wealth/Income", MeanNO2_2010 ~ "Neighborhood Exposure")) %>%
+    add_glance_table(include = c(r.squared, AIC)) %>%
+    modify_header(estimate = "NO\U2082", label = NA)
+  
+  tbl_merge(
+    list(tbl_1, tbl_2, tbl_3, tbl_4, tbl_5, tbl_6, tbl_7, tbl_8), tab_spanner= FALSE) %>%
+    #rearrange so that intercept and stats on bottom
+    modify_table_body(~.x %>% arrange(label == "(Intercept)")) %>%
+    modify_table_body(~.x %>% arrange(row_type == "glance_statistic")) %>%
+    modify_caption(paste(clock_name," aging: Multivariable associations with individual covariates and neighborhood exposures.")) %>%
+    modify_footnote(everything() ~ "β (95% confidence interval) *p<0.05; **p<0.01; ***p<0.001") %>%
+    as_flex_table() %>% bold(part = "header") %>% fontsize(size = 10, part = "all") %>%
+    merge_v(j = 1) %>% hline(i = ~ label %in% "(Intercept)") %>%
+    autofit() %>% #makes heights pretty but width too big
+    width(j = 2:ncol_keys(.), width = 0.81) # width to make it pretty. First column may still go off the page.
+}
+
+LinearModels("GrimAge_scale")
+LinearModels("DPoAm_scale")
+```
+
+Individual-level SES explains a large portion of the disparities in both GrimAge and DPoAm but not all. SDI further explains a portion of both and is significantly associated with GrimAge. Perceived social disorder may explain a small portion of the disparity in GrimAge.
+
+## DPoAm: Interactions with PM2.5
+
+```{r DPoAminteractions, results='asis'}
+Race_model <- lm(DPoAm_scale ~ Race*MeanPM25_2014 + Gender + Education + IndexQuart, epiclocks_complete, weights = VBSI16WGTRA)
+Gender_model <- lm(DPoAm_scale ~ Gender*MeanPM25_2014 + Race + Education + IndexQuart, epiclocks_complete, weights = VBSI16WGTRA)
+Index_model <- lm(DPoAm_scale ~ IndexQuart*MeanPM25_2014 + Gender + Race + Education, epiclocks_complete, weights = VBSI16WGTRA)
+SDI_model <- lm(DPoAm_scale ~ SDI*MeanPM25_2014 + Gender + Race + Education + IndexQuart, epiclocks_complete, weights = VBSI16WGTRA)
+
+tbl_race <- tbl_regression(Race_model, intercept = TRUE, label = IndexQuart ~ "Quartile Wealth/Income") %>%
+  add_glance_table(include = c(r.squared, AIC)) %>%
+  modify_header(estimate = "Race", label = "DPoAm") %>%
+  bold_labels()
+tbl_gender <-tbl_regression(Gender_model, intercept = TRUE, label = IndexQuart ~ "Quartile Wealth/Income") %>%
+  add_glance_table(include = c(r.squared, AIC)) %>%
+  modify_header(estimate = "Gender", label = NA)
+tbl_SES <-tbl_regression(Index_model, intercept = TRUE, label = IndexQuart ~ "Quartile Wealth/Income") %>%
+  add_glance_table(include = c(r.squared, AIC)) %>%
+  modify_header(estimate = "Individual SES", label = NA)
+tbl_SDI <-tbl_regression(SDI_model, intercept = TRUE, label = IndexQuart ~ "Quartile Wealth/Income") %>%
+  add_glance_table(include = c(r.squared, AIC)) %>%
+  modify_header(estimate = "SDI", label = NA)
+
+tbl_merge(
+  list(tbl_race, tbl_gender, tbl_SES, tbl_SDI), tab_spanner= FALSE) %>%
+  #rearrange so that intercept and stats on bottom
+  modify_table_body(~.x %>% arrange(label == "PM2.5")) %>%
+  modify_table_body(~.x %>% arrange(label == "(Intercept)")) %>%
+  modify_table_body(~.x %>% arrange(row_type == "glance_statistic")) %>%
+  modify_footnote(everything() ~ "β (95% confidence interval) *p<0.05; **p<0.01; ***p<0.001") %>%
+  modify_caption("DPoAm aging: Interactions between environmental and social determinants and PM2.5") %>%
+  as_flex_table() %>% bold(part = "header") %>% fontsize(size = 10, part = "all") %>% hline(i = ~ label %in% "(Intercept)") %>%
+  set_table_properties(layout = 'autofit', width = 1)
+```
+
+PM2.5 interacts significantly with race in the DPoAm model, indicating that Black individuals have increased vulnerability to PM2.5 exposure. 
+There were no significant interactions for GrimAge (see supplement). The lack of interaction for NO2 may be due to having 2010 data only, since using PM2.5 values from 2010 also results in no significant interaction (see supplement).
+We next wanted to determine which social determinants may influence vulnerability to PM2.5. Both individual-level and neighborhood-level SES may play a role in vulnerability to PM2.5 exposure, although results are inconclusive.
+
+```{r PM25plots, fig.height = 6.25, fig.width = 6.25}
+seqCut <- function(x) {seq(from = min(x), to = max(x), by = 0.2)}
+
+#try plotting "manually" from emmip dataframe
+Race_DF <- emmip(Race_model, Race ~ MeanPM25_2014, cov.reduce = seqCut, CIs = TRUE, plotit=FALSE)
+Gender_DF <- emmip(Gender_model, Gender ~ MeanPM25_2014, cov.reduce = seqCut, CIs = TRUE, plotit = FALSE)
+Index_DF <- emmip(Index_model, IndexQuart ~ MeanPM25_2014, cov.reduce = seqCut, CIs = TRUE, plotit = FALSE) %>%
+  filter(IndexQuart == 1 | IndexQuart == 4)
+SDIlist <- list(MeanPM25_2014 = seq(from = min(epiclocks_complete$MeanPM25_2014), to=max(epiclocks_complete$MeanPM25_2014), by = 0.2), SDI = quantile(epiclocks_complete$SDI, probs = c(0.1, 0.9)))
+SDI_DF <- emmip(SDI_model, SDI ~ MeanPM25_2014, at=SDIlist, CIs = TRUE, plotit = FALSE) %>%
+  mutate(SDI = as.factor(SDI))
+
+#Make the plots and grid
+Alpha = 0.3
+
+Race_plot <- ggplot(data = Race_DF, aes(x = MeanPM25_2014, color = Race)) +
+  geom_line(aes(y = yvar), size = 1) +
+  geom_ribbon(aes(ymin = LCL, ymax = UCL, fill = Race), alpha = Alpha, linetype = 'dashed') +
+  ylab("Predicted DPoAm Aging") + 
+  theme(axis.title.x = element_blank()) +
+  scale_color_manual(values= c(rgb(5,113,176, maxColorValue = 255), rgb(202,0,32, maxColorValue = 255)), guide =guide_legend(title.position = "top")) +
+  scale_fill_manual(values= c(rgb(5,113,176, maxColorValue = 255), rgb(202,0,32, maxColorValue = 255)))
+
+Gender_plot <- ggplot(data = Gender_DF, aes(x = MeanPM25_2014, color = Gender)) +
+  geom_line(aes(y = yvar), size = 1) +
+  geom_ribbon(aes(ymin = LCL, ymax = UCL, fill = Gender), alpha = Alpha, linetype = 'dashed') +
+  theme(axis.title.x = element_blank(), axis.title.y = element_blank()) +
+  scale_color_manual(values= c(rgb(5,113,176, maxColorValue = 255), rgb(202,0,32, maxColorValue = 255)), guide = guide_legend(title.position = "top")) +
+  scale_fill_manual(values= c(rgb(5,113,176, maxColorValue = 255), rgb(202,0,32, maxColorValue = 255)))
+
+Index_plot <- ggplot(data = Index_DF, aes(x = MeanPM25_2014, color = IndexQuart)) +
+  geom_line(aes(y = yvar), size = 1) +
+  geom_ribbon(aes(ymin = LCL, ymax = UCL, fill = IndexQuart), alpha = Alpha, linetype = 'dashed') +
+  labs(x = expression("PM2.5 (μg/m"^3~")"), y = "Predicted DPoAm Aging", color = "Wealth/Income Quartile", fill = "Wealth/Income Quartile") +
+  scale_color_manual(values= c(rgb(5,113,176, maxColorValue = 255), rgb(202,0,32, maxColorValue = 255)), labels = c("4th", "1st"), guide = guide_legend(title.position = "top")) +
+  scale_fill_manual(values= c(rgb(5,113,176, maxColorValue = 255), rgb(202,0,32, maxColorValue = 255)), labels = c("4th", "1st"))
+
+SDI_plot <- ggplot(data = SDI_DF, aes(x = MeanPM25_2014, color = SDI)) +
+  geom_line(aes(y = yvar), size = 1) +
+  geom_ribbon(aes(ymin = LCL, ymax = UCL, fill = SDI), alpha = Alpha, linetype = 'dashed') +
+  labs(x = expression("PM2.5 (μg/m"^3~")")) +
+  theme(axis.title.y = element_blank()) +
+  scale_y_continuous(breaks = c(-0.25, 0.00, 0.25, 0.5)) +
+  scale_color_manual(values= c(rgb(5,113,176, maxColorValue = 255), rgb(202,0,32, maxColorValue = 255)), labels = c("10th percentile", "90th percentile"), guide =guide_legend(title.position = "top"))  +
+  scale_fill_manual(values= c(rgb(5,113,176, maxColorValue = 255), rgb(202,0,32, maxColorValue = 255)), labels = c("10th percentile", "90th percentile"))
+
+p <- plot_grid(Race_plot, Gender_plot, Index_plot, SDI_plot, ncol = 2, nrow = 2, labels = "AUTO", labelsize = 12, label_fontface = "bold")
+
+# The cairo_ps device sometimes causes RStudio to crash.
+#Saving to pdf or postscript (and then converting to pdf) are other options
+#library(Cairo)
+#CairoPS(file = "Fig1.ps", width = 6.25, height = 6.25)
+
+print(p)
+ggsave(file = "Fig1.eps", device = cairo_ps, height = 6.25, width = 6.25, units = 'in', dpi = 300)
+
+#ggsave(file = "Fig1.pdf", height = 6.25, width = 6.25, units = 'in', dpi = 300)
+
+```
+
+## Decomposition
+
+```{r oaxaca, cache =TRUE}
+#Kittagawa-Blinder-Oaxaca decomposition. With sample weights
+#In order to have results be independent of the reference group chosen for categorical variables, using dummy variables is necessary. 
+#The oaxaca package does not currently support multiple categorical variables.
+#So I hack it a little bit: run two separate models, one where education is invariant of reference group, and one where income/wealth quartile is invariant to reference group, then combine the results. I've confirmed that this is valid- none of the other results change.
+GrimAge_Ed <- oaxaca(GrimAge_scale ~ Gender + EdSC + EdHS + EdLTHS + IndexQuart + SDI + SocialDisorder + PhysicalDisorder + MeanPM25_2014  + MeanO3_2014 + MeanNO2_2010 | White | EdSC + EdHS + EdLTHS,  data = epiclocks_complete, R= bootstrap, reg.fun = lm)
+
+GrimAge_decomp <- oaxaca(GrimAge_scale ~ Gender + Education + Index3 + Index2 + Index1 + SDI + SocialDisorder + PhysicalDisorder + MeanPM25_2014  + MeanO3_2014 + MeanNO2_2010 | White | Index3 + Index2 + Index1,  data = epiclocks_complete, R= bootstrap, reg.fun = lm)
+
+DPoAm_Ed <- oaxaca(DPoAm_scale ~ Gender + EdSC + EdHS + EdLTHS + IndexQuart + SDI + SocialDisorder + PhysicalDisorder + MeanPM25_2014  + MeanO3_2014 + MeanNO2_2010 | White | EdSC + EdHS + EdLTHS,  data = epiclocks_complete, R= bootstrap, reg.fun = lm)
+
+DPoAm_decomp <- oaxaca(DPoAm_scale ~ Gender + Education + Index3 + Index2 + Index1 + SDI + SocialDisorder + PhysicalDisorder + MeanPM25_2014  + MeanO3_2014 + MeanNO2_2010 | White | Index3 + Index2 + Index1,  data = epiclocks_complete, R= bootstrap, reg.fun = lm)
+
+#Replace education results in Index table with results from Education table
+#Turns out this automagically changes the 95% CIs too!
+GrimAge_decomp$threefold$variables[3:5,] <- GrimAge_Ed$threefold$variables[3:5,]
+DPoAm_decomp$threefold$variables[3:5,] <- DPoAm_Ed$threefold$variables[3:5,]
+
+save(GrimAge_Ed, GrimAge_decomp, DPoAm_Ed, DPoAm_decomp, file = "Decompresults_invariant.Rda")
+```
+
+Kittagawa-Blinder-Oaxaca threefold decomposition results using the Oaxaca() package.
+Confidence intervals calculated using `r bootstrap` bootstraps.
+Complete case analysis excluding all cases missing data. Weighted linear regression is the underlying model.
+
+```{r plotoaxaca, fig.width=7.5, fig.height = 5.5}
+load("Decompresults_invariant.Rda")
+
+#Plot threefold endowment and coefficient results
+#exclude intercept and base (the omitted categorical dummy variable I think)
+Plotvariables = c("GenderFemale","EducationSome College", "EducationHigh School", "Education< High School", "Index3TRUE", "Index2TRUE", "Index1TRUE", "SDI", "SocialDisorder", "PhysicalDisorder", "MeanPM25_2014", "MeanO3_2014", "MeanNO2_2010")
+Plotlabels = c("GenderFemale"="Female","EducationHigh School" = "High school", "EducationSome College" = "Education: Some college", "Education< High School" = "Less than High School", "Index2TRUE" = "2nd Quartile", "Index3TRUE" = "Wealth/Income: 3rd Quartile", "Index1TRUE" = "Lowest Quartile", "SDI" = "Social Deprivation Index", "SocialDisorder"="Social Disorder", "PhysicalDisorder"="Physical Disorder", "MeanPM25_2014" = "PM2.5", "MeanO3_2014" = "Ozone", "MeanNO2_2010" ="NO2")
+
+GrimEndow <- plot(GrimAge_decomp, "threefold", components = "endowments", ci.level = .95, title = "A: GrimAge", variables = Plotvariables, variable.labels = Plotlabels) +
+  #theme_plot() + 
+  theme(axis.text.y = element_text(size = 10)) +
+  scale_y_continuous(breaks= c(-.1,0,.1))
+GrimCoeff <- plot(GrimAge_decomp, "threefold", components="coefficients", ci.level = .95, variables= Plotvariables) +
+  #theme_plot() + 
+  theme(axis.text.y = element_blank(), axis.ticks.y = element_blank())
+#plot_grid(GrimEndow, GrimCoeff, align = "h", nrow = 1)
+#Use plots to extract CI's of estimates for each variable and overall
+Gvariables <- plot(GrimAge_decomp, "threefold", ci.level = .95)
+Goverall <- plot(GrimAge_decomp, "threefold", type = "overall", ci.level = .95)
+
+#Plot threefold decomposition endowment and coefficient results
+DuneEndow <- plot(DPoAm_decomp, "threefold", components = "endowments", ci.level = .95, title="B: DPoAm", variables = Plotvariables, variable.labels = Plotlabels) +
+  #theme_plot() + 
+  theme(axis.text.y = element_text(size = 10))
+DuneCoeff <- plot(DPoAm_decomp, "threefold", components="coefficients", ci.level = .95, variables= Plotvariables)+
+  #theme_plot() + 
+  theme(axis.text.y = element_blank(), axis.ticks.y = element_blank())
+#plot_grid(DuneEndow, DuneCoeff, align = "h", nrow = 1)
+#Use plots to extract CI's of estimates for each variable and overall
+Dvariables <- plot(DPoAm_decomp, "threefold", ci.level = .95)
+Doverall <- plot(DPoAm_decomp, "threefold", type = "overall", ci.level = .95)
+
+plot_grid(GrimEndow, GrimCoeff, DuneEndow, DuneCoeff, ncol = 2, nrow = 2, labelsize = 12)
+ggsave(file = "Fig2.eps", height = 6, width = 7, units = "in", dpi = 300)
+```
+
+## Supplemental information
+
+### Missingness, whether moved, and disparity with ancestry-informative PCs
+
+```{r hiddenTables, include = FALSE, results='asis'}
+#Missing vs not missing
+tbl_summary(epiclocks_all, by = Missing, include = c(Age, Race, Gender, GrimAge_scale, DPoAm_scale, Education, SDI, SocialDisorder, PhysicalDisorder, MeanPM25_2014, MeanO3_2014, MeanNO2_2010), 
+            statistic = list(all_continuous() ~ "{mean} ({sd})"), 
+            digits = list(all_continuous() ~ 2)) %>% add_p() %>% modify_caption("**Missingness**") %>% as_flex_table()
+
+#Moved vs not moved
+tbl_summary(epiclocks_complete, by = Moved_2010_2016, include = c(Age, Race, Gender, GrimAge_scale, DPoAm_scale, Education, SDI, SocialDisorder, PhysicalDisorder, MeanPM25_2014, MeanO3_2014, MeanNO2_2010), 
+            statistic = list(all_continuous() ~ "{mean} ({sd})"), 
+            digits = list(all_continuous() ~ 2)) %>% add_p() %>% modify_caption("**Whether Moved**") %>% as_flex_table()
+```
+
+```{r S1Table, results='asis'}
+#Disparity in DNAm aging raw, weighted, and corrected for ancestry-informative genetic principal components
+tbl_summary(epiclocks_complete, by = Race, include = c(GrimAge_Resid, GrimAge_weighted, GrimAge_PC, DPoAm_Resid, DPoAm_weighted, DPoAm_PC), type = everything() ~ "continuous", statistic = list(all_continuous() ~ "{mean} ({sd})"), digits = all_continuous() ~ 2) %>%
+  add_difference() %>% modify_column_hide(ci) %>% add_stat(all_continuous() ~ CohensD) %>%
+  modify_caption("**DNAm Aging**") %>% modify_header(add_stat_1 = "Effect Size") %>% modify_footnote(add_stat_1 = "Cohen's D") %>%
+  as_flex_table() %>% bold(part = "header") %>% fontsize(size = 10, part = "all") %>% set_table_properties(layout = 'autofit', width = 1)
+```
+
+### Linear models: excluding individuals who moved between 2010-2016
+
+Excluded `r nrow(filter(epiclocks_complete, Moved_2010_2016))` who moved between 2010 and 2016. Magnitude of race coefficient decreases overall, but patterns and associations do not change.
+
+```{r S23Tables, results = 'asis'}
+SensitivityModels <- function(clock) {
+  Model_1 <- lm(epiclocks_complete[[clock]] ~ Race, epiclocks_complete, subset = !Moved_2010_2016, weights = VBSI16WGTRA)
+  Model_2 <- update(Model_1, . ~ . + Gender + Education + IndexQuart)
+  Model_3 <- update(Model_2, .~. + SDI)
+  Model_4 <- update(Model_2, .~. + SocialDisorder)
+  Model_5 <- update(Model_2, .~. + PhysicalDisorder)
+  Model_6 <- update(Model_2, .~. + MeanPM25_2014)
+  Model_7 <- update(Model_2, .~. + MeanO3_2014)
+  Model_8 <- update(Model_2, .~. + MeanNO2_2010)
+  
+  clock_name <- gsub("_scale","",clock)
+  
+    tbl_1 <-tbl_regression(Model_1, intercept = TRUE) %>%
+    add_glance_table(include = c(r.squared, AIC, nobs)) %>% 
+    modify_header(estimate = "Total disparity", label = clock_name) %>% bold_labels()
+  tbl_2 <-tbl_regression(Model_2, intercept = TRUE, label = IndexQuart ~ "Quartile Wealth/Income") %>%
+    add_glance_table(include = c(r.squared, AIC, nobs)) %>%
+    modify_header(estimate = "Individual SES", label = NA)
+  tbl_3 <-tbl_regression(Model_3, intercept = TRUE, label = list(IndexQuart ~ "Quartile Wealth/Income", SDI ~ "Neighborhood Exposure")) %>%
+    add_glance_table(include = c(r.squared, AIC, nobs)) %>%
+    modify_header(estimate = "SDI", label = NA)
+  tbl_4 <-tbl_regression(Model_4, intercept = TRUE, label = list(IndexQuart ~ "Quartile Wealth/Income", SocialDisorder ~ "Neighborhood Exposure")) %>% 
+    add_glance_table(include = c(r.squared, AIC, nobs)) %>%
+    modify_header(estimate = "Social Disorder", label = NA)
+  tbl_5 <-tbl_regression(Model_5, intercept = TRUE, label = list(IndexQuart ~ "Quartile Wealth/Income", PhysicalDisorder ~ "Neighborhood Exposure")) %>%
+    add_glance_table(include = c(r.squared, AIC, nobs)) %>%
+    modify_header(estimate = "Physical Disorder", label = NA)
+  tbl_6 <-tbl_regression(Model_6, intercept = TRUE, label = list(IndexQuart ~ "Quartile Wealth/Income", MeanPM25_2014 ~ "Neighborhood Exposure")) %>%
+    add_glance_table(include = c(r.squared, AIC, nobs)) %>%
+    modify_header(estimate = "PM2.5", label = NA)
+  tbl_7 <-tbl_regression(Model_7, intercept = TRUE, label = list(IndexQuart ~ "Quartile Wealth/Income", MeanO3_2014 ~ "Neighborhood Exposure")) %>%
+    add_glance_table(include = c(r.squared, AIC, nobs)) %>%
+    modify_header(estimate = "Ozone", label = NA)
+  tbl_8 <-tbl_regression(Model_8, intercept = TRUE, list(IndexQuart ~ "Quartile Wealth/Income", MeanNO2_2010 ~ "Neighborhood Exposure")) %>%
+    add_glance_table(include = c(r.squared, AIC, nobs)) %>%
+    modify_header(estimate = "NO\U2082", label = NA)
+  
+  tbl_merge(
+    list(tbl_1, tbl_2, tbl_3, tbl_4, tbl_5, tbl_6, tbl_7, tbl_8), tab_spanner= FALSE) %>%
+    #rearrange so that intercept and stats on bottom
+    modify_table_body(~.x %>% arrange(label == "(Intercept)")) %>%
+    modify_table_body(~.x %>% arrange(row_type == "glance_statistic")) %>%
+    modify_caption(paste(clock_name," aging: Multivariable associations with individual covariates and neighborhood exposures.")) %>%
+    modify_footnote(everything() ~ "β (95% confidence interval) *p<0.05; **p<0.01; ***p<0.001") %>%
+    as_flex_table() %>% bold(part = "header") %>% fontsize(size = 10, part = "all") %>%
+    merge_v(j = 1) %>% hline(i = ~ label %in% "(Intercept)") %>%
+    autofit() %>% #makes heights pretty but width too big
+    width(j = 2:ncol_keys(.), width = 0.81) # width to make it pretty. First column may still go off the page.
+}
+
+SensitivityModels("GrimAge_scale")
+SensitivityModels("DPoAm_scale")
+```
+
+### Full Interactions results
+
+```{r S45Table, results = 'asis'}
+Interaction_Models <- function(clock) {
+  Model_1 <- lm(epiclocks_complete[[clock]] ~ Race*SDI + Gender + Education + IndexQuart, epiclocks_complete, weights = VBSI16WGTRA)
+  Model_2 <- lm(epiclocks_complete[[clock]] ~ Race*SocialDisorder + Gender + Education + IndexQuart, epiclocks_complete, weights = VBSI16WGTRA)
+  Model_3 <- lm(epiclocks_complete[[clock]] ~ Race*PhysicalDisorder + Gender + Education + IndexQuart, epiclocks_complete, weights = VBSI16WGTRA)
+  Model_4 <- lm(epiclocks_complete[[clock]] ~ Race*MeanPM25_2014 + Gender + Education + IndexQuart, epiclocks_complete, weights = VBSI16WGTRA)
+  Model_5 <- lm(epiclocks_complete[[clock]] ~ Race*MeanO3_2014 + Gender + Education + IndexQuart, epiclocks_complete, weights = VBSI16WGTRA)
+  Model_6 <- lm(epiclocks_complete[[clock]] ~ Race*MeanNO2_2010 + Gender + Education + IndexQuart, epiclocks_complete, weights = VBSI16WGTRA)
+  Model_7 <- lm(DPoAm_scale ~ Race*MeanPM25_2010 + Gender + Education + IndexQuart, epiclocks_complete, weights = VBSI16WGTRA)
+  
+  clock_name <- gsub("_scale","",clock)
+  
+  tbl_1 <-tbl_regression(Model_1, intercept = TRUE, label = list(IndexQuart ~ "Quartile Wealth/Income", SDI ~ "Neighborhood Exposure")) %>%
+    add_glance_table(include = c(r.squared, AIC)) %>%
+    modify_header(estimate = "SDI", label = clock_name) %>%
+    bold_labels()
+  tbl_2 <-tbl_regression(Model_2, intercept = TRUE, label = list(IndexQuart ~ "Quartile Wealth/Income", SocialDisorder ~ "Neighborhood Exposure")) %>%
+    add_glance_table(include = c(r.squared, AIC)) %>%
+    modify_header(estimate = "Social Disorder", label = NA)
+  tbl_3 <-tbl_regression(Model_3, intercept = TRUE, label = list(IndexQuart ~ "Quartile Wealth/Income", PhysicalDisorder ~ "Neighborhood Exposure")) %>%
+    add_glance_table(include = c(r.squared, AIC)) %>%
+    modify_header(estimate = "Physical Disorder", label = NA)
+  tbl_4 <-tbl_regression(Model_4, intercept = TRUE, label = list(IndexQuart ~ "Quartile Wealth/Income", MeanPM25_2014 ~ "Neighborhood Exposure")) %>%
+    add_glance_table(include = c(r.squared, AIC)) %>%
+    modify_header(estimate = "PM2.5 (2014)", label = NA)
+  tbl_5 <-tbl_regression(Model_5, intercept = TRUE, list(IndexQuart ~ "Quartile Wealth/Income", MeanO3_2014 ~ "Neighborhood Exposure")) %>%
+    add_glance_table(include = c(r.squared, AIC)) %>%
+    modify_header(estimate = "Ozone (2014)", label = NA)
+  tbl_6 <-tbl_regression(Model_6, intercept = TRUE, list(IndexQuart ~ "Quartile Wealth/Income", MeanNO2_2010 ~ "Neighborhood Exposure")) %>%
+    add_glance_table(include = c(r.squared, AIC)) %>%
+    modify_header(estimate = "NO\U2082 (2010)", label = NA)
+  tbl_7 <-tbl_regression(Model_7, intercept = TRUE, list(IndexQuart ~ "Quartile Wealth/Income", MeanPM25_2010 ~ "Neighborhood Exposure")) %>%
+    add_glance_table(include = c(r.squared, AIC)) %>%
+    modify_header(estimate = "PM2.5 (2010)", label = NA)
+  
+  tbl_merge(
+    list(tbl_1, tbl_2, tbl_3, tbl_4, tbl_5, tbl_6, tbl_7), tab_spanner= FALSE) %>%
+    #rearrange so that interaction terms, intercept and stats on bottom
+    modify_table_body(~.x %>% arrange(label == "Neighborhood Exposure")) %>%
+    modify_table_body(~.x %>% arrange(label == "Race * Neighborhood Exposure")) %>%
+    modify_table_body(~.x %>% arrange(label == "Black * Neighborhood Exposure")) %>%
+    modify_table_body(~.x %>% arrange(label == "(Intercept)")) %>%
+    modify_table_body(~.x %>% arrange(row_type == "glance_statistic")) %>%
+    modify_footnote(everything() ~ "β (95% confidence interval) *p<0.05; **p<0.01; ***p<0.001") %>%
+    modify_caption(paste(clock_name," aging: Interactions interactions between neighborhood exposures and race")) %>%
+    as_flex_table() %>% bold(part = "header") %>% fontsize(size = 10, part = "all") %>%
+    merge_v(j = 1) %>% hline(i = ~ label %in% "(Intercept)") %>%
+    autofit() %>% #makes heights pretty but width too big
+    width(j = 2:ncol_keys(.), width = 0.81) # width to make it pretty. First column may still go off the page.
+}
+
+Interaction_Models("DPoAm_scale")
+Interaction_Models("GrimAge_scale")
+```
+
+```{r S6Table, results = 'asis'}
+Social_model <- lm(DPoAm_scale ~ SocialDisorder*MeanPM25_2014 + Gender + Race + Education + IndexQuart, epiclocks_complete, weights = VBSI16WGTRA)
+Physical_model <- lm(DPoAm_scale ~ PhysicalDisorder*MeanPM25_2014 + Gender + Race + Education + IndexQuart, epiclocks_complete, weights = VBSI16WGTRA)
+Ed_model <- lm(DPoAm_scale ~ Education*MeanPM25_2014 + Gender + Race + IndexQuart, epiclocks_complete, weights = VBSI16WGTRA)
+
+tbl_education <-tbl_regression(Ed_model, intercept = TRUE, label = IndexQuart ~ "Quartile Wealth/Income") %>%
+  add_glance_table(include = c(r.squared, AIC)) %>%
+  modify_header(estimate = "Education", label = "DPoAm")
+tbl_social <-tbl_regression(Social_model, intercept = TRUE, label = IndexQuart ~ "Quartile Wealth/Income") %>%
+  add_glance_table(include = c(r.squared, AIC)) %>%
+  modify_header(estimate = "Social Disorder", label = NA)
+tbl_physical <-tbl_regression(Physical_model, intercept = TRUE, label = IndexQuart ~ "Quartile Wealth/Income") %>%
+  add_glance_table(include = c(r.squared, AIC)) %>%
+  modify_header(estimate = "Physical Disorder", label = NA)
+tbl_race <- tbl_regression(Race_model, intercept = TRUE, label = IndexQuart ~ "Quartile Wealth/Income") %>%
+  add_glance_table(include = c(r.squared, AIC)) %>%
+  modify_header(estimate = "Race", label = "DPoAm") %>%
+  bold_labels()
+tbl_gender <-tbl_regression(Gender_model, intercept = TRUE, label = IndexQuart ~ "Quartile Wealth/Income") %>%
+  add_glance_table(include = c(r.squared, AIC)) %>%
+  modify_header(estimate = "Gender", label = NA)
+tbl_SES <-tbl_regression(Index_model, intercept = TRUE, label = IndexQuart ~ "Quartile Wealth/Income") %>%
+  add_glance_table(include = c(r.squared, AIC)) %>%
+  modify_header(estimate = "Individual SES", label = NA)
+tbl_SDI <-tbl_regression(SDI_model, intercept = TRUE, label = IndexQuart ~ "Quartile Wealth/Income") %>%
+  add_glance_table(include = c(r.squared, AIC)) %>%
+  modify_header(estimate = "SDI", label = NA)
+
+tbl_merge(
+  list(tbl_race, tbl_gender, tbl_SES, tbl_education, tbl_SDI, tbl_social, tbl_physical), tab_spanner= FALSE) %>%
+  #rearrange so that intercept and stats on bottom
+  #modify_table_body(~.x %>% arrange(label == "PM2.5")) %>%
+  modify_table_body(~.x %>% arrange(label == "(Intercept)")) %>%
+  modify_table_body(~.x %>% arrange(row_type == "glance_statistic")) %>%
+  modify_footnote(everything() ~ "β (95% confidence interval) *p<0.05; **p<0.01; ***p<0.001") %>%
+  modify_caption("DPoAm aging: Interactions between environmental and social determinants and PM2.5") %>%
+  as_flex_table() %>% bold(part = "header") %>% fontsize(size = 10, part = "all") %>% hline(i = ~ label %in% "(Intercept)") %>%
+  autofit() %>% #makes heights pretty but width too big
+  width(j = 2:ncol_keys(.), width = 0.81) # width to make it pretty. First column may still go off the page.
+
+```
+
+### Table of full decomposition results
+
+```{r S7Table, results ='asis'}
+#Coerce full decomposition results into a table
+Oaxacalabels = c("Intercept","Female", "Education: Some College", "High School", "Less than High School", "Wealth/Income: 3rd Quartile", "2nd Quartile", "Lowest Quartile", "Social Deprivation Index", "Social Disorder", "Physical Disorder", "PM2.5", "Ozone", "NO\U2082", "Base")
+#Gather variable estimates and standard errors, variable names, and tidy
+Grim_variabledecomp <- as.data.frame(GrimAge_decomp$threefold$variables) %>%
+  mutate(Variable = Oaxacalabels) %>%
+  pivot_longer(cols = -Variable, names_to = c(".value", "Component"), names_pattern = "(.+)\\((.+)\\)")
+#Extract confidence intervals from the plot objects. Panel indicates component, group indicates variable
+GrimCIs <- select(ggplot_build(Gvariables)$data[[5]], ymin, ymax, PANEL) %>% 
+  mutate(Component = case_when(PANEL == 1 ~ "endowments",
+                               PANEL == 2 ~ "coefficients",
+                               PANEL == 3 ~ "interaction"),
+         Variable = rep.int(Oaxacalabels, 3), .keep = 'unused') %>% rename("CILow" = "ymin", "CIHigh" = "ymax")
+Grim_variabledecomp <- full_join(Grim_variabledecomp, GrimCIs, by = c("Variable", "Component"))
+#Gather overall estimates and tidy
+Grim_overalldecomp <- as.data.frame(t(as.matrix(GrimAge_decomp$threefold$overall))) %>%
+  mutate(Variable = "Overall") %>%
+  pivot_longer(cols = -Variable, names_to = c(".value", "Component"), names_pattern = "(.+)\\((.+)\\)")
+#Extract confidence intervals from the plot object.
+Grim_overalldecomp$CILow <- ggplot_build(Goverall)$data[[5]]$ymin
+Grim_overalldecomp$CIHigh <- ggplot_build(Goverall)$data[[5]]$ymax
+#Combine overall and variable results, add percentage explained
+Grim_decompresults <- rbind(Grim_overalldecomp, Grim_variabledecomp) %>%
+  mutate(Percent = 100*coef/GrimAge_decomp$y$y.diff, Component = str_to_title(Component)) 
+
+#Same thing for DPoAm
+Dune_variabledecomp <- as.data.frame(DPoAm_decomp$threefold$variables) %>%
+  mutate(Variable = Oaxacalabels) %>%
+  pivot_longer(cols = -Variable, names_to = c(".value", "Component"), names_pattern = "(.+)\\((.+)\\)")
+#Extract confidence intervals from the plot objects. Panel indicates component
+DuneCIs <- select(ggplot_build(Dvariables)$data[[5]], ymin, ymax, PANEL) %>% 
+  mutate(Component = case_when(PANEL == 1 ~ "endowments",
+                               PANEL == 2 ~ "coefficients",
+                               PANEL == 3 ~ "interaction"),
+         Variable = rep.int(Oaxacalabels, 3), .keep = 'unused') %>% rename("CILow" = "ymin", "CIHigh" = "ymax")
+Dune_variabledecomp <- full_join(Dune_variabledecomp, DuneCIs, by = c("Variable", "Component"))
+Dune_overalldecomp <- as.data.frame(t(as.matrix(DPoAm_decomp$threefold$overall))) %>%
+  mutate(Variable = "Overall") %>%
+  pivot_longer(cols = -Variable, names_to = c(".value", "Component"), names_pattern = "(.+)\\((.+)\\)")
+Dune_overalldecomp$CILow <- ggplot_build(Doverall)$data[[5]]$ymin
+Dune_overalldecomp$CIHigh <- ggplot_build(Doverall)$data[[5]]$ymax
+Dune_decompresults <- rbind(Dune_overalldecomp, Dune_variabledecomp) %>%
+  mutate(Percent = 100*coef/DPoAm_decomp$y$y.diff, Component = str_to_title(Component))
+
+#Put all results together into one pretty table
+Decompresults <- bind_rows("GrimAge" = Grim_decompresults, "DPoAm" = Dune_decompresults, .id = "Clock") %>%
+  pivot_wider(names_from= "Clock", values_from = c(coef, se, CILow, CIHigh, Percent)) %>% filter(Variable != "Base") %>%
+  #Use flextable to nicely display the results
+  flextable(col_keys = c("Variable", "Component", "Percent_GrimAge", "coef_GrimAge", "dummy_GrimAge", "Percent_DPoAm", "coef_DPoAm", "dummy_DPoAm")) %>%
+  #Merge CI's into one column
+  compose(j = "dummy_GrimAge", value = as_paragraph("(", CILow_GrimAge, ", ", CIHigh_GrimAge, ")")) %>%
+  compose(j = "dummy_DPoAm", value = as_paragraph("(", CILow_DPoAm, ", ", CIHigh_DPoAm, ")")) %>%
+  #Bold significant values (CI's don't cross zero)
+  bold(i = ~ CILow_GrimAge < 0 & CIHigh_GrimAge < 0, j = c('Percent_GrimAge', 'coef_GrimAge', 'dummy_GrimAge')) %>%
+  bold(i = ~ CILow_GrimAge > 0 & CIHigh_GrimAge > 0, j = c('Percent_GrimAge', 'coef_GrimAge', 'dummy_GrimAge')) %>%
+  bold(i = ~ CILow_DPoAm < 0 & CIHigh_DPoAm < 0, j = c('Percent_DPoAm', 'coef_DPoAm', 'dummy_DPoAm')) %>%
+  bold(i = ~ CILow_DPoAm > 0 & CIHigh_DPoAm > 0, j = c('Percent_DPoAm', 'coef_DPoAm', 'dummy_DPoAm')) %>%
+  #Merge variable names to avoid repetition and look nice
+  merge_v(j = ~ Variable) %>% colformat_double()%>%
+  set_caption("Threefold decomposition of individual and neighborhood contributions to racial disparity in DNAm aging.") %>%
+  #Add header to separate clock results
+  add_header(Percent_GrimAge = "GrimAge", coef_GrimAge = "GrimAge", dummy_GrimAge= "GrimAge", Percent_DPoAm = "DPoAm", coef_DPoAm = "DPoAm", dummy_DPoAm = "DPoAm") %>%
+  merge_h(part = "header") %>%
+  #Add lines for appearance
+  hline(i = seq(from = 3, to = 42, by = 3), part = "body") %>%
+  vline(j = c('Component', 'dummy_GrimAge')) %>%
+  set_header_labels(Percent_GrimAge = "Percent", coef_GrimAge = "Estimate", dummy_GrimAge= "95% CI", Percent_DPoAm = "Percent", coef_DPoAm = "Estimate", dummy_DPoAm = "95% CI") %>%
+  align(align = "center", part = "all", j = 3:8) %>%
+  set_table_properties(layout = 'autofit', width = 1)
+
+Decompresults 
+```
+
+
